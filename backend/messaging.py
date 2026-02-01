@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+
+import httpx
 
 
 @dataclass
@@ -26,5 +29,35 @@ def format_session_cancelled() -> str:
 
 
 def send_message(_msg: OutboundMessage) -> None:
-    # MVP stub: integrate WhatsApp/SMS later. Keep backend operational without external dependencies.
-    return
+    api_key = (os.getenv("SMSMODE_API_KEY") or "").strip()
+    if not api_key:
+        return
+
+    base_url = (os.getenv("SMSMODE_BASE_URL") or "https://rest.smsmode.com").strip().rstrip("/")
+    url = f"{base_url}/sms/v1/messages"
+
+    phone = (_msg.phone or "").strip()
+    text = (_msg.text or "").strip()
+    if not phone or not text:
+        return
+
+    payload = {
+        "recipient": {"to": phone},
+        "body": {"text": text},
+    }
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "X-Api-Key": api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+    except Exception:
+        # Do not break core flows if SMS provider fails.
+        return
