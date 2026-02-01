@@ -11,6 +11,8 @@ import type {
   Urgency,
 } from './types'
 
+const API_BASE_URL = ((import.meta as any)?.env?.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') || ''
+
 function getClinicPin(): string {
   try {
     return localStorage.getItem('opd_clinic_pin_v1') || ''
@@ -129,7 +131,7 @@ export async function dismissNotification(notificationId: number, phone: string)
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const pin = getClinicPin()
   const clinicId = getClinicId()
-  const resp = await fetch(path, {
+  const resp = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
