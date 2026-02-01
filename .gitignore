@@ -1,0 +1,6 @@
+.env
+opd.sqlite3
+*.sqlite3
+__pycache__/
+.venv/
+node_modules/

@@ -6,13 +6,9 @@ from datetime import datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session as OrmSession
 
-from .db import make_engine, make_session_local
 from .messaging import OutboundMessage, format_delay_notice, format_session_cancelled, format_token_confirmation, send_message
-from .models import Base, ClientEvent, Session, Token, TokenState
-from .queue_logic import compute_arrival_window, get_next_eligible_token, get_serving_token, get_upcoming_tokens
+from .queue_logic import compute_arrival_window
 from .schemas import (
     BulkEventsRequest,
     EmergencyRequest,
@@ -25,6 +21,22 @@ from .schemas import (
     TokenOut,
     WalkInRequest,
 )
+from .supabase_client import get_supabase_client
+
+
+def _sb_data(resp) -> list[dict]:
+    err = getattr(resp, "error", None)
+    if err:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {err}")
+    data = getattr(resp, "data", None)
+    if data is None:
+        raise HTTPException(status_code=502, detail="Supabase error: empty response")
+    return list(data)
+
+
+def _sb_one(resp) -> dict | None:
+    data = _sb_data(resp)
+    return data[0] if data else None
 
 
 app = FastAPI(title="OPD Queue Orchestrator MVP", version="0.1")
@@ -37,14 +49,6 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-
-ENGINE = make_engine()
-SessionLocal = make_session_local(ENGINE)
-
-if ENGINE.dialect.name == "sqlite":
-    Base.metadata.create_all(bind=ENGINE)
-
-
 def staff_dep(x_clinic_pin: str | None = Header(default=None, alias="X-Clinic-Pin")):
     configured = os.getenv("CLINIC_PIN", "0000")
     if not configured:
@@ -53,12 +57,11 @@ def staff_dep(x_clinic_pin: str | None = Header(default=None, alias="X-Clinic-Pi
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def db_dep():
-    db = SessionLocal()
+def sb_dep():
     try:
-        yield db
-    finally:
-        db.close()
+        return get_supabase_client()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def _today_key() -> str:
@@ -104,18 +107,105 @@ def _intake_stub(req: IntakeRequest) -> IntakeResult:
     return IntakeResult(urgency=urgency, intake_summary=safe_summary)
 
 
-def _get_or_create_session(db: OrmSession, clinic_id: str, doctor_id: str, date_key: str | None) -> Session:
-    dk = date_key or _today_key()
-    q = select(Session).where(Session.clinic_id == clinic_id, Session.doctor_id == doctor_id, Session.date_key == dk)
-    s = db.execute(q).scalars().first()
-    if s:
-        return s
+class _SessionLike:
+    def __init__(self, row: dict):
+        for k, v in row.items():
+            setattr(self, k, v)
 
-    s = Session(clinic_id=clinic_id, doctor_id=doctor_id, date_key=dk)
-    db.add(s)
-    db.commit()
-    db.refresh(s)
-    return s
+
+def _sb_get_or_create_session(sb, clinic_id: str, doctor_id: str, date_key: str | None) -> dict:
+    dk = date_key or _today_key()
+    resp = (
+        sb.table("sessions")
+        .select("*")
+        .eq("clinic_id", clinic_id)
+        .eq("doctor_id", doctor_id)
+        .eq("date_key", dk)
+        .limit(1)
+        .execute()
+    )
+    row = _sb_one(resp)
+    if row:
+        return row
+
+    ins = {
+        "clinic_id": clinic_id,
+        "doctor_id": doctor_id,
+        "date_key": dk,
+    }
+    created = _sb_data(sb.table("sessions").insert(ins).execute())
+    return created[0]
+
+
+def _sb_get_tokens(sb, session_id: int, states: list[str], limit: int | None = None) -> list[dict]:
+    q = (
+        sb.table("tokens")
+        .select("*")
+        .eq("session_id", session_id)
+        .in_("state", states)
+        .order("token_no", desc=False)
+    )
+    if limit:
+        q = q.limit(limit)
+    return _sb_data(q.execute())
+
+
+def _sb_get_serving_token(sb, session_id: int) -> dict | None:
+    resp = (
+        sb.table("tokens")
+        .select("*")
+        .eq("session_id", session_id)
+        .eq("state", "SERVING")
+        .limit(1)
+        .execute()
+    )
+    return _sb_one(resp)
+
+
+def _sb_get_next_eligible(sb, session_id: int) -> dict | None:
+    resp = (
+        sb.table("tokens")
+        .select("*")
+        .eq("session_id", session_id)
+        .in_("state", ["ARRIVED", "BOOKED", "SKIPPED"])
+        .order("token_no", desc=False)
+        .limit(1)
+        .execute()
+    )
+    return _sb_one(resp)
+
+
+def _sb_update_token(sb, token_id: int, patch: dict) -> None:
+    _sb_data(sb.table("tokens").update(patch).eq("id", token_id).execute())
+
+
+def _sb_update_session(sb, session_id: int, patch: dict) -> None:
+    _sb_data(sb.table("sessions").update(patch).eq("id", session_id).execute())
+
+
+def _sb_insert_client_event(sb, session_id: int, client_id: str, event_id: str, event_type: str, payload: dict) -> bool:
+    existing = (
+        sb.table("client_events")
+        .select("id")
+        .eq("client_id", client_id)
+        .eq("event_id", event_id)
+        .limit(1)
+        .execute()
+    )
+    if _sb_one(existing):
+        return False
+    _sb_data(
+        sb.table("client_events").insert(
+        {
+            "session_id": session_id,
+            "client_id": client_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "payload_json": json.dumps(payload or {}),
+        }
+        ).execute()
+    )
+    return True
 
 
 @app.get("/api/health")
@@ -124,17 +214,17 @@ def health():
 
 
 @app.post("/api/sessions", response_model=SessionOut)
-def create_session(body: SessionCreate, db: OrmSession = Depends(db_dep)):
-    s = _get_or_create_session(db, body.clinic_id, body.doctor_id, body.date_key)
-    if s.planned_leave:
+def create_session(body: SessionCreate, sb=Depends(sb_dep)):
+    s = _sb_get_or_create_session(sb, body.clinic_id, body.doctor_id, body.date_key)
+    if bool(s.get("planned_leave")):
         raise HTTPException(status_code=409, detail="Planned leave: bookings disabled")
-    return SessionOut(**s.__dict__)
+    return SessionOut(**s)
 
 
 @app.get("/api/sessions/current", response_model=SessionOut)
-def get_current_session(clinic_id: str = "default", doctor_id: str = "default", db: OrmSession = Depends(db_dep)):
-    s = _get_or_create_session(db, clinic_id, doctor_id, None)
-    return SessionOut(**s.__dict__)
+def get_current_session(clinic_id: str = "default", doctor_id: str = "default", sb=Depends(sb_dep)):
+    s = _sb_get_or_create_session(sb, clinic_id, doctor_id, None)
+    return SessionOut(**s)
 
 
 @app.post("/api/intake", response_model=IntakeResult)
@@ -143,114 +233,136 @@ def intake(body: IntakeRequest):
 
 
 @app.post("/api/tokens/book", response_model=TokenOut)
-def book_token(body: IntakeRequest, clinic_id: str = "default", doctor_id: str = "default", db: OrmSession = Depends(db_dep)):
-    s = _get_or_create_session(db, clinic_id, doctor_id, None)
-    if s.planned_leave or s.unplanned_closed:
+def book_token(body: IntakeRequest, clinic_id: str = "default", doctor_id: str = "default", sb=Depends(sb_dep)):
+    s = _sb_get_or_create_session(sb, clinic_id, doctor_id, None)
+    if bool(s.get("planned_leave")) or bool(s.get("unplanned_closed")):
         raise HTTPException(status_code=409, detail="OPD is closed")
 
     phone = body.phone.strip()
 
-    existing_q = select(Token).where(
-        Token.session_id == s.id,
-        Token.phone == phone,
-        Token.state.in_([TokenState.BOOKED, TokenState.ARRIVED, TokenState.SERVING, TokenState.SKIPPED]),
+    existing = (
+        sb.table("tokens")
+        .select("*")
+        .eq("session_id", int(s["id"]))
+        .eq("phone", phone)
+        .in_("state", ["BOOKED", "ARRIVED", "SERVING", "SKIPPED"])
+        .order("token_no", desc=False)
+        .limit(1)
+        .execute()
     )
-    existing = db.execute(existing_q).scalars().first()
-    if existing:
+    existing_row = _sb_one(existing)
+    if existing_row:
+        existing = existing_row
         now = datetime.now()
-        position_index = max(0, existing.token_no - 1)
-        w = compute_arrival_window(s, position_index, now)
+        position_index = max(0, int(existing["token_no"]) - 1)
+        w = compute_arrival_window(_SessionLike(s), position_index, now)
         return TokenOut(
-            id=existing.id,
-            token_no=existing.token_no,
-            phone=existing.phone,
-            name=existing.name,
-            urgency=existing.urgency,
-            state=existing.state.value,
+            id=int(existing["id"]),
+            token_no=int(existing["token_no"]),
+            phone=str(existing.get("phone") or ""),
+            name=str(existing.get("name") or ""),
+            urgency=str(existing.get("urgency") or "low"),
+            state=str(existing.get("state") or "BOOKED"),
             arrival_window_start=_fmt_time(w.start),
             arrival_window_end=_fmt_time(w.end),
         )
 
-    max_no = db.execute(select(func.max(Token.token_no)).where(Token.session_id == s.id)).scalar()
-    next_no = int(max_no or 0) + 1
+    max_row = (
+        sb.table("tokens")
+        .select("token_no")
+        .eq("session_id", int(s["id"]))
+        .order("token_no", desc=True)
+        .limit(1)
+        .execute()
+    )
+    max_existing = _sb_one(max_row)
+    next_no = (int(max_existing["token_no"]) + 1) if max_existing else 1
 
     intake_res = _intake_stub(body)
 
-    t = Token(
-        session_id=s.id,
-        token_no=next_no,
-        phone=phone,
-        name=(body.name or "").strip(),
-        urgency=intake_res.urgency,
-        complaint_text=(body.complaint_text or "").strip(),
-        intake_summary=intake_res.intake_summary,
-        state=TokenState.BOOKED,
-        last_state_change_at=datetime.utcnow(),
+    created = (
+        sb.table("tokens")
+        .insert(
+            {
+                "session_id": int(s["id"]),
+                "token_no": next_no,
+                "phone": phone,
+                "name": (body.name or "").strip(),
+                "urgency": intake_res.urgency,
+                "complaint_text": (body.complaint_text or "").strip(),
+                "intake_summary": intake_res.intake_summary,
+                "state": "BOOKED",
+                "last_state_change_at": datetime.utcnow().isoformat(),
+            }
+        )
+        .execute()
     )
-    db.add(t)
-    db.commit()
-    db.refresh(t)
+    t = _sb_data(created)[0]
 
     now = datetime.now()
-    w = compute_arrival_window(s, position_index=max(0, t.token_no - 1), now=now)
+    w = compute_arrival_window(_SessionLike(s), position_index=max(0, int(t["token_no"]) - 1), now=now)
 
-    msg = OutboundMessage(phone=t.phone, text=format_token_confirmation(t.token_no, _fmt_time(w.start), _fmt_time(w.end)))
+    msg = OutboundMessage(
+        phone=str(t.get("phone") or ""),
+        text=format_token_confirmation(int(t["token_no"]), _fmt_time(w.start), _fmt_time(w.end)),
+    )
     send_message(msg)
 
     return TokenOut(
-        id=t.id,
-        token_no=t.token_no,
-        phone=t.phone,
-        name=t.name,
-        urgency=t.urgency,
-        state=t.state.value,
+        id=int(t["id"]),
+        token_no=int(t["token_no"]),
+        phone=str(t.get("phone") or ""),
+        name=str(t.get("name") or ""),
+        urgency=str(t.get("urgency") or "low"),
+        state=str(t.get("state") or "BOOKED"),
         arrival_window_start=_fmt_time(w.start),
         arrival_window_end=_fmt_time(w.end),
     )
 
 
 @app.post("/api/tokens/{token_id}/arrive")
-def mark_arrived(token_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    t = db.get(Token, token_id)
+def mark_arrived(token_id: int, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    t = _sb_one(sb.table("tokens").select("*").eq("id", token_id).limit(1).execute())
     if not t:
         raise HTTPException(status_code=404, detail="Token not found")
-    if t.state in [TokenState.CANCELLED, TokenState.COMPLETED]:
+    if t.get("state") in ["CANCELLED", "COMPLETED"]:
         return {"ok": True}
 
-    t.state = TokenState.ARRIVED
-    t.arrived_at = t.arrived_at or datetime.utcnow()
-    t.last_state_change_at = datetime.utcnow()
-    db.commit()
+    patch = {
+        "state": "ARRIVED",
+        "arrived_at": t.get("arrived_at") or datetime.utcnow().isoformat(),
+        "last_state_change_at": datetime.utcnow().isoformat(),
+    }
+    _sb_update_token(sb, int(t["id"]), patch)
     return {"ok": True}
 
 
 @app.get("/api/queue/state", response_model=QueueStateOut)
-def queue_state(session_id: int, db: OrmSession = Depends(db_dep)):
-    s = db.get(Session, session_id)
+def queue_state(session_id: int, sb=Depends(sb_dep)):
+    s = _sb_one(sb.table("sessions").select("*").eq("id", session_id).limit(1).execute())
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
+    serving = _sb_get_serving_token(sb, session_id)
+    upcoming = _sb_get_tokens(sb, session_id, states=["ARRIVED", "BOOKED", "SKIPPED"], limit=12)
 
-    serving = get_serving_token(db, session_id)
-    upcoming = get_upcoming_tokens(db, session_id, limit=12)
-
-    def to_token(x: Token) -> QueueStateToken:
+    def to_token(x: dict) -> QueueStateToken:
         return QueueStateToken(
-            id=x.id,
-            token_no=x.token_no,
-            name=x.name,
-            phone=x.phone,
-            urgency=x.urgency,
-            state=x.state.value,
+            id=int(x["id"]),
+            token_no=int(x["token_no"]),
+            name=str(x.get("name") or ""),
+            phone=str(x.get("phone") or ""),
+            urgency=str(x.get("urgency") or "low"),
+            state=str(x.get("state") or "BOOKED"),
         )
 
     stats = {
-        "emergency_debt_minutes": s.emergency_debt_minutes,
-        "unplanned_closed": s.unplanned_closed,
-        "planned_leave": s.planned_leave,
+        "emergency_debt_minutes": s.get("emergency_debt_minutes"),
+        "unplanned_closed": s.get("unplanned_closed"),
+        "planned_leave": s.get("planned_leave"),
     }
 
     return QueueStateOut(
-        session_id=s.id,
+        session_id=int(s["id"]),
         now_iso=datetime.utcnow().isoformat(),
         serving=to_token(serving) if serving else None,
         upcoming=[to_token(x) for x in upcoming],
@@ -259,176 +371,174 @@ def queue_state(session_id: int, db: OrmSession = Depends(db_dep)):
 
 
 @app.post("/api/queue/serve_next")
-def serve_next(session_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    s = db.get(Session, session_id)
+def serve_next(session_id: int, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    s = _sb_one(sb.table("sessions").select("*").eq("id", session_id).limit(1).execute())
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
-    if s.unplanned_closed:
+    if bool(s.get("unplanned_closed")):
         raise HTTPException(status_code=409, detail="OPD closed")
 
-    current = get_serving_token(db, session_id)
+    current = _sb_get_serving_token(sb, session_id)
     if current:
-        current.state = TokenState.COMPLETED
-        current.completed_at = datetime.utcnow()
-        current.last_state_change_at = datetime.utcnow()
+        _sb_update_token(
+            sb,
+            int(current["id"]),
+            {
+                "state": "COMPLETED",
+                "completed_at": datetime.utcnow().isoformat(),
+                "last_state_change_at": datetime.utcnow().isoformat(),
+            },
+        )
 
-    nxt = get_next_eligible_token(db, session_id)
+    nxt = _sb_get_next_eligible(sb, session_id)
     if not nxt:
-        db.commit()
         return {"ok": True, "served": None}
 
-    if nxt.state == TokenState.BOOKED:
-        nxt.state = TokenState.SKIPPED
-        nxt.last_state_change_at = datetime.utcnow()
-        db.commit()
+    if nxt.get("state") == "BOOKED":
+        _sb_update_token(sb, int(nxt["id"]), {"state": "SKIPPED", "last_state_change_at": datetime.utcnow().isoformat()})
         return {"ok": True, "served": None, "note": "next token not arrived; skipped"}
 
-    nxt.state = TokenState.SERVING
-    nxt.serving_at = datetime.utcnow()
-    nxt.last_state_change_at = datetime.utcnow()
-    db.commit()
-    return {"ok": True, "served": {"token_id": nxt.id, "token_no": nxt.token_no}}
+    _sb_update_token(
+        sb,
+        int(nxt["id"]),
+        {"state": "SERVING", "serving_at": datetime.utcnow().isoformat(), "last_state_change_at": datetime.utcnow().isoformat()},
+    )
+    return {"ok": True, "served": {"token_id": int(nxt["id"]), "token_no": int(nxt["token_no"])}}
 
 
 @app.post("/api/queue/skip")
-def skip_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    t = db.get(Token, token_id)
-    if not t or t.session_id != session_id:
+def skip_token(session_id: int, token_id: int, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    t = _sb_one(sb.table("tokens").select("*").eq("id", token_id).limit(1).execute())
+    if not t or int(t.get("session_id") or 0) != session_id:
         raise HTTPException(status_code=404, detail="Token not found")
-    if t.state in [TokenState.CANCELLED, TokenState.COMPLETED]:
+    if t.get("state") in ["CANCELLED", "COMPLETED"]:
         return {"ok": True}
-    if t.state == TokenState.SERVING:
-        t.state = TokenState.SKIPPED
-        t.last_state_change_at = datetime.utcnow()
-    elif t.state == TokenState.BOOKED:
-        t.state = TokenState.SKIPPED
-        t.last_state_change_at = datetime.utcnow()
-    db.commit()
+    if t.get("state") in ["SERVING", "BOOKED"]:
+        _sb_update_token(sb, token_id, {"state": "SKIPPED", "last_state_change_at": datetime.utcnow().isoformat()})
     return {"ok": True}
 
 
 @app.post("/api/queue/cancel")
-def cancel_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    t = db.get(Token, token_id)
-    if not t or t.session_id != session_id:
+def cancel_token(session_id: int, token_id: int, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    t = _sb_one(sb.table("tokens").select("*").eq("id", token_id).limit(1).execute())
+    if not t or int(t.get("session_id") or 0) != session_id:
         raise HTTPException(status_code=404, detail="Token not found")
-    t.state = TokenState.CANCELLED
-    t.last_state_change_at = datetime.utcnow()
-    db.commit()
+    _sb_update_token(sb, token_id, {"state": "CANCELLED", "last_state_change_at": datetime.utcnow().isoformat()})
     return {"ok": True}
 
 
 @app.post("/api/queue/walkin")
-def add_walkin(session_id: int, body: WalkInRequest, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    s = db.get(Session, session_id)
+def add_walkin(session_id: int, body: WalkInRequest, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    s = _sb_one(sb.table("sessions").select("*").eq("id", session_id).limit(1).execute())
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    max_no = db.execute(select(func.max(Token.token_no)).where(Token.session_id == s.id)).scalar()
-    next_no = int(max_no or 0) + 1
-
-    t = Token(
-        session_id=s.id,
-        token_no=next_no,
-        phone=body.phone.strip(),
-        name=(body.name or "").strip(),
-        urgency=body.urgency,
-        complaint_text=(body.complaint_text or "").strip(),
-        intake_summary="Walk-in added by staff. No diagnosis provided.",
-        state=TokenState.ARRIVED,
-        arrived_at=datetime.utcnow(),
-        last_state_change_at=datetime.utcnow(),
+    max_row = (
+        sb.table("tokens")
+        .select("token_no")
+        .eq("session_id", session_id)
+        .order("token_no", desc=True)
+        .limit(1)
+        .execute()
     )
-    db.add(t)
-    db.commit()
-    db.refresh(t)
-    return {"ok": True, "token_id": t.id, "token_no": t.token_no}
+    max_existing = _sb_one(max_row)
+    next_no = (int(max_existing["token_no"]) + 1) if max_existing else 1
+
+    created = (
+        sb.table("tokens")
+        .insert(
+            {
+                "session_id": session_id,
+                "token_no": next_no,
+                "phone": body.phone.strip(),
+                "name": (body.name or "").strip(),
+                "urgency": body.urgency,
+                "complaint_text": (body.complaint_text or "").strip(),
+                "intake_summary": "Walk-in added by staff. No diagnosis provided.",
+                "state": "ARRIVED",
+                "arrived_at": datetime.utcnow().isoformat(),
+                "last_state_change_at": datetime.utcnow().isoformat(),
+            }
+        )
+        .execute()
+    )
+    t = _sb_data(created)[0]
+    return {"ok": True, "token_id": int(t["id"]), "token_no": int(t["token_no"]) }
 
 
 @app.post("/api/queue/emergency")
-def trigger_emergency(session_id: int, body: EmergencyRequest, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    s = db.get(Session, session_id)
+def trigger_emergency(session_id: int, body: EmergencyRequest, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    s = _sb_one(sb.table("sessions").select("*").eq("id", session_id).limit(1).execute())
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
-
-    s.emergency_debt_minutes += body.minutes
-    db.commit()
+    debt = int(s.get("emergency_debt_minutes") or 0) + int(body.minutes)
+    _sb_update_session(sb, session_id, {"emergency_debt_minutes": debt})
 
     send_message(OutboundMessage(phone="", text=format_delay_notice()))
 
-    return {"ok": True, "emergency_debt_minutes": s.emergency_debt_minutes}
+    return {"ok": True, "emergency_debt_minutes": debt}
 
 
 @app.post("/api/sessions/{session_id}/close_now")
-def close_now(session_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    s = db.get(Session, session_id)
+def close_now(session_id: int, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    s = _sb_one(sb.table("sessions").select("*").eq("id", session_id).limit(1).execute())
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    s.unplanned_closed = True
+    _sb_update_session(sb, session_id, {"unplanned_closed": True})
 
-    q = select(Token).where(
-        Token.session_id == session_id,
-        Token.state.in_([TokenState.BOOKED, TokenState.ARRIVED, TokenState.SERVING, TokenState.SKIPPED]),
-    )
-    tokens = list(db.execute(q).scalars().all())
+    tokens = _sb_get_tokens(sb, session_id, states=["BOOKED", "ARRIVED", "SERVING", "SKIPPED"], limit=None)
     for t in tokens:
-        t.state = TokenState.CANCELLED
-        t.last_state_change_at = datetime.utcnow()
-        if t.phone:
-            send_message(OutboundMessage(phone=t.phone, text=format_session_cancelled()))
+        _sb_update_token(sb, int(t["id"]), {"state": "CANCELLED", "last_state_change_at": datetime.utcnow().isoformat()})
+        if t.get("phone"):
+            send_message(OutboundMessage(phone=str(t.get("phone") or ""), text=format_session_cancelled()))
 
-    db.commit()
     return {"ok": True, "cancelled": len(tokens)}
 
 
 @app.post("/api/events/bulk")
-def bulk_events(body: BulkEventsRequest, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
-    s = db.get(Session, body.session_id)
+def bulk_events(body: BulkEventsRequest, sb=Depends(sb_dep), _staff=Depends(staff_dep)):
+    s = _sb_one(sb.table("sessions").select("*").eq("id", body.session_id).limit(1).execute())
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
 
     accepted = 0
     for e in body.events:
-        existing = db.execute(
-            select(ClientEvent).where(ClientEvent.client_id == body.client_id, ClientEvent.event_id == e.event_id)
-        ).scalars().first()
-        if existing:
+        if not _sb_insert_client_event(sb, body.session_id, body.client_id, e.event_id, e.event_type, e.payload or {}):
             continue
-
-        ce = ClientEvent(
-            session_id=body.session_id,
-            client_id=body.client_id,
-            event_id=e.event_id,
-            event_type=e.event_type,
-            payload_json=json.dumps(e.payload or {}),
-        )
-        db.add(ce)
 
         if e.event_type == "ARRIVE":
             token_id = int((e.payload or {}).get("token_id"))
             if token_id:
-                t = db.get(Token, token_id)
-                if t and t.session_id == body.session_id:
-                    if t.state not in [TokenState.CANCELLED, TokenState.COMPLETED]:
-                        t.state = TokenState.ARRIVED
-                        t.arrived_at = t.arrived_at or datetime.utcnow()
-                        t.last_state_change_at = datetime.utcnow()
+                rows = sb.table("tokens").select("*").eq("id", token_id).limit(1).execute().data
+                t = rows[0] if rows else None
+                if t and int(t.get("session_id") or 0) == body.session_id:
+                    if t.get("state") not in ["CANCELLED", "COMPLETED"]:
+                        _sb_update_token(
+                            sb,
+                            token_id,
+                            {
+                                "state": "ARRIVED",
+                                "arrived_at": t.get("arrived_at") or datetime.utcnow().isoformat(),
+                                "last_state_change_at": datetime.utcnow().isoformat(),
+                            },
+                        )
         elif e.event_type == "SERVE_NEXT":
-            serve_next(body.session_id, db)
+            serve_next(body.session_id, sb)
         elif e.event_type == "SKIP":
             token_id = int((e.payload or {}).get("token_id"))
             if token_id:
-                skip_token(body.session_id, token_id, db)
+                skip_token(body.session_id, token_id, sb)
         elif e.event_type == "CANCEL":
             token_id = int((e.payload or {}).get("token_id"))
             if token_id:
-                cancel_token(body.session_id, token_id, db)
+                cancel_token(body.session_id, token_id, sb)
         elif e.event_type == "EMERGENCY":
             minutes = int((e.payload or {}).get("minutes") or 10)
-            s.emergency_debt_minutes += minutes
+            debt = int(s.get("emergency_debt_minutes") or 0) + minutes
+            s["emergency_debt_minutes"] = debt
+            _sb_update_session(sb, body.session_id, {"emergency_debt_minutes": debt})
 
         accepted += 1
 
-    db.commit()
     return {"ok": True, "accepted": accepted}
