@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
@@ -37,9 +38,19 @@ app.add_middleware(
 )
 
 
-ENGINE = make_engine("/root/iiit/opd.sqlite3")
+ENGINE = make_engine()
 SessionLocal = make_session_local(ENGINE)
-Base.metadata.create_all(bind=ENGINE)
+
+if ENGINE.dialect.name == "sqlite":
+    Base.metadata.create_all(bind=ENGINE)
+
+
+def staff_dep(x_clinic_pin: str | None = Header(default=None, alias="X-Clinic-Pin")):
+    configured = os.getenv("CLINIC_PIN", "0000")
+    if not configured:
+        return
+    if x_clinic_pin != configured:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def db_dep():
@@ -199,7 +210,7 @@ def book_token(body: IntakeRequest, clinic_id: str = "default", doctor_id: str =
 
 
 @app.post("/api/tokens/{token_id}/arrive")
-def mark_arrived(token_id: int, db: OrmSession = Depends(db_dep)):
+def mark_arrived(token_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     t = db.get(Token, token_id)
     if not t:
         raise HTTPException(status_code=404, detail="Token not found")
@@ -248,7 +259,7 @@ def queue_state(session_id: int, db: OrmSession = Depends(db_dep)):
 
 
 @app.post("/api/queue/serve_next")
-def serve_next(session_id: int, db: OrmSession = Depends(db_dep)):
+def serve_next(session_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     s = db.get(Session, session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -280,7 +291,7 @@ def serve_next(session_id: int, db: OrmSession = Depends(db_dep)):
 
 
 @app.post("/api/queue/skip")
-def skip_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep)):
+def skip_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     t = db.get(Token, token_id)
     if not t or t.session_id != session_id:
         raise HTTPException(status_code=404, detail="Token not found")
@@ -297,7 +308,7 @@ def skip_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep))
 
 
 @app.post("/api/queue/cancel")
-def cancel_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep)):
+def cancel_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     t = db.get(Token, token_id)
     if not t or t.session_id != session_id:
         raise HTTPException(status_code=404, detail="Token not found")
@@ -308,7 +319,7 @@ def cancel_token(session_id: int, token_id: int, db: OrmSession = Depends(db_dep
 
 
 @app.post("/api/queue/walkin")
-def add_walkin(session_id: int, body: WalkInRequest, db: OrmSession = Depends(db_dep)):
+def add_walkin(session_id: int, body: WalkInRequest, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     s = db.get(Session, session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -335,7 +346,7 @@ def add_walkin(session_id: int, body: WalkInRequest, db: OrmSession = Depends(db
 
 
 @app.post("/api/queue/emergency")
-def trigger_emergency(session_id: int, body: EmergencyRequest, db: OrmSession = Depends(db_dep)):
+def trigger_emergency(session_id: int, body: EmergencyRequest, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     s = db.get(Session, session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -349,7 +360,7 @@ def trigger_emergency(session_id: int, body: EmergencyRequest, db: OrmSession = 
 
 
 @app.post("/api/sessions/{session_id}/close_now")
-def close_now(session_id: int, db: OrmSession = Depends(db_dep)):
+def close_now(session_id: int, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     s = db.get(Session, session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -372,7 +383,7 @@ def close_now(session_id: int, db: OrmSession = Depends(db_dep)):
 
 
 @app.post("/api/events/bulk")
-def bulk_events(body: BulkEventsRequest, db: OrmSession = Depends(db_dep)):
+def bulk_events(body: BulkEventsRequest, db: OrmSession = Depends(db_dep), _staff=Depends(staff_dep)):
     s = db.get(Session, body.session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")

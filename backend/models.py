@@ -65,7 +65,11 @@ class Token(Base):
     complaint_text: Mapped[str] = mapped_column(Text, default="")
     intake_summary: Mapped[str] = mapped_column(Text, default="")
 
-    state: Mapped[TokenState] = mapped_column(Enum(TokenState), default=TokenState.BOOKED, index=True)
+    state: Mapped[TokenState] = mapped_column(
+        Enum(TokenState, name="token_state", native_enum=True, create_constraint=False),
+        default=TokenState.BOOKED,
+        index=True,
+    )
 
     booked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     arrived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -95,3 +99,19 @@ class ClientEvent(Base):
     __table_args__ = (
         UniqueConstraint("client_id", "event_id", name="uq_client_event"),
     )
+
+
+class MessageOutbox(Base):
+    __tablename__ = "message_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    token_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+    phone: Mapped[str] = mapped_column(String(32), default="")
+    message_type: Mapped[str] = mapped_column(String(32), default="INFO")
+    text: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

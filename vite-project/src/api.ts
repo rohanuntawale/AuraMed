@@ -1,10 +1,20 @@
 import type { QueueState, SessionOut, Urgency } from './types'
 
+function getClinicPin(): string {
+  try {
+    return localStorage.getItem('opd_clinic_pin_v1') || ''
+  } catch {
+    return ''
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const pin = getClinicPin()
   const resp = await fetch(path, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
+      ...(pin ? { 'X-Clinic-Pin': pin } : {}),
       ...(init?.headers || {}),
     },
   })
@@ -65,5 +75,40 @@ export async function triggerEmergency(sessionId: number, minutes: number): Prom
   return apiFetch<any>(`/api/queue/emergency?session_id=${encodeURIComponent(sessionId)}`, {
     method: 'POST',
     body: JSON.stringify({ minutes }),
+  })
+}
+
+export async function intake(body: { phone: string; name?: string; complaint_text: string }): Promise<{ urgency: Urgency; intake_summary: string }> {
+  return apiFetch<{ urgency: Urgency; intake_summary: string }>('/api/intake', {
+    method: 'POST',
+    body: JSON.stringify({
+      phone: body.phone,
+      name: body.name || '',
+      complaint_text: body.complaint_text,
+    }),
+  })
+}
+
+export async function bookToken(body: {
+  phone: string
+  name?: string
+  complaint_text: string
+}): Promise<{
+  id: number
+  token_no: number
+  phone: string
+  name: string
+  urgency: string
+  state: string
+  arrival_window_start: string
+  arrival_window_end: string
+}> {
+  return apiFetch<any>('/api/tokens/book', {
+    method: 'POST',
+    body: JSON.stringify({
+      phone: body.phone,
+      name: body.name || '',
+      complaint_text: body.complaint_text,
+    }),
   })
 }

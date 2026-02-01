@@ -2,6 +2,14 @@ import type { BulkEvent } from './types'
 
 const KEY = 'opd_offline_events_v1'
 
+function getClinicPin(): string {
+  try {
+    return localStorage.getItem('opd_clinic_pin_v1') || ''
+  } catch {
+    return ''
+  }
+}
+
 function load(): BulkEvent[] {
   try {
     const raw = localStorage.getItem(KEY)
@@ -36,9 +44,14 @@ export async function flushQueue(params: { clientId: string; sessionId: number }
   const events = load()
   if (events.length === 0) return { ok: true, accepted: 0 }
 
+  const pin = getClinicPin()
+
   const resp = await fetch('/api/events/bulk', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(pin ? { 'X-Clinic-Pin': pin } : {}),
+    },
     body: JSON.stringify({
       client_id: params.clientId,
       session_id: params.sessionId,
